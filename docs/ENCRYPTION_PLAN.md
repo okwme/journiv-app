@@ -42,9 +42,9 @@ This document outlines the architectural changes needed to implement end-to-end 
 
 We will use **client-side encryption** with a user-specific master key:
 
-1. **User Master Key**: Derived from user password using PBKDF2 or Argon2
+1. **User Master Key**: Derived from user password using Argon2 (recommended over PBKDF2 for better GPU resistance)
 2. **Data Encryption Keys (DEKs)**: Per-user symmetric keys for encrypting data
-3. **Key Encryption Key (KEK)**: Master key encrypts DEKs for storage
+3. **Master Key as KEK**: The master key directly encrypts DEKs for storage (master key serves as the Key Encryption Key)
 4. **Algorithm**: AES-256-GCM for authenticated encryption
 
 ```
@@ -59,29 +59,31 @@ DEK → Encrypts → User Data (entries, media)
 
 ### Field-Level Encryption
 
-Implement transparent field-level encryption using SQLAlchemy type decorators:
+Implement transparent field-level encryption using SQLAlchemy type decorators with context-aware key access:
 
 ```python
 # New file: app/core/encryption.py
 
 from cryptography.fernet import Fernet
-from sqlalchemy.types import TypeDecorator, String, LargeBinary
+from sqlalchemy.types import TypeDecorator, LargeBinary
+from contextvars import ContextVar
 import base64
 
+# Context variable to store the current user's encryption key
+_current_user_key: ContextVar[Optional[bytes]] = ContextVar('current_user_key', default=None)
+
 class EncryptedString(TypeDecorator):
-    """Encrypted string column type."""
+    """Encrypted string column type with context-aware key access."""
     impl = LargeBinary
     cache_ok = True
-    
-    def __init__(self, key_provider, *args, **kwargs):
-        self.key_provider = key_provider
-        super().__init__(*args, **kwargs)
     
     def process_bind_param(self, value, dialect):
         """Encrypt value before storing in database."""
         if value is None:
             return None
-        key = self.key_provider()
+        key = _current_user_key.get()
+        if key is None:
+            raise ValueError("Encryption key not available in context")
         f = Fernet(key)
         return f.encrypt(value.encode('utf-8'))
     
@@ -89,7 +91,9 @@ class EncryptedString(TypeDecorator):
         """Decrypt value when reading from database."""
         if value is None:
             return None
-        key = self.key_provider()
+        key = _current_user_key.get()
+        if key is None:
+            raise ValueError("Encryption key not available in context")
         f = Fernet(key)
         return f.decrypt(value).decode('utf-8')
 ```
@@ -101,25 +105,25 @@ Update models to use encrypted fields:
 ```python
 # app/models/entry.py (modified)
 
-from app.core.encryption import EncryptedString, get_user_encryption_key
+from app.core.encryption import EncryptedString
 
 class Entry(BaseModel, table=True):
-    # Encrypted fields
+    # Encrypted fields using the context-aware EncryptedString type
     title: Optional[str] = Field(
         None,
-        sa_column=Column(EncryptedString(get_user_encryption_key), nullable=True)
+        sa_column=Column(EncryptedString(), nullable=True)
     )
     content: str = Field(
         ...,
-        sa_column=Column(EncryptedString(get_user_encryption_key), nullable=False)
+        sa_column=Column(EncryptedString(), nullable=False)
     )
     location: Optional[str] = Field(
         None,
-        sa_column=Column(EncryptedString(get_user_encryption_key), nullable=True)
+        sa_column=Column(EncryptedString(), nullable=True)
     )
     weather: Optional[str] = Field(
         None,
-        sa_column=Column(EncryptedString(get_user_encryption_key), nullable=True)
+        sa_column=Column(EncryptedString(), nullable=True)
     )
     # ... rest remains unencrypted (timestamps, IDs, etc.)
 ```
@@ -146,7 +150,7 @@ class UserEncryptionKey(BaseModel, table=True):
     encrypted_dek: bytes = Field(..., sa_column=Column(LargeBinary, nullable=False))
     # Salt for key derivation
     salt: bytes = Field(..., sa_column=Column(LargeBinary(32), nullable=False))
-    # KDF parameters (for Argon2: iterations, memory, parallelism)
+    # KDF parameters (for Argon2: time_cost, memory_cost, parallelism)
     kdf_params: str = Field(..., sa_column=Column(String(500), nullable=False))
     # Key version for key rotation support
     key_version: int = Field(default=1, ge=1)
@@ -238,25 +242,52 @@ async def _generate_thumbnail(
 
 ### Key Derivation
 
-Derive master key from user password at login:
+Derive master key from user password at login using Argon2:
 
 ```python
 # app/core/encryption.py
 
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from argon2 import PasswordHasher
+from argon2.low_level import hash_secret_raw, Type
 import os
 
-def derive_master_key(password: str, salt: bytes) -> bytes:
-    """Derive master key from password using PBKDF2."""
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,  # 256 bits
+def derive_master_key(password: str, salt: bytes, 
+                     time_cost: int = 3, 
+                     memory_cost: int = 65536,
+                     parallelism: int = 4) -> bytes:
+    """
+    Derive master key from password using Argon2id.
+    
+    Argon2id is recommended over PBKDF2 for better resistance against
+    GPU-based attacks and side-channel attacks.
+    
+    Args:
+        password: User's password
+        salt: Random 32-byte salt
+        time_cost: Number of iterations (default: 3)
+        memory_cost: Memory usage in KiB (default: 64 MiB)
+        parallelism: Number of parallel threads (default: 4)
+    
+    Returns:
+        32-byte encryption key
+    """
+    return hash_secret_raw(
+        secret=password.encode('utf-8'),
         salt=salt,
-        iterations=600000,  # OWASP recommended minimum
+        time_cost=time_cost,
+        memory_cost=memory_cost,
+        parallelism=parallelism,
+        hash_len=32,  # 256 bits
+        type=Type.ID  # Argon2id - hybrid version resistant to both side-channel and GPU attacks
     )
-    return kdf.derive(password.encode('utf-8'))
 ```
+
+**Why Argon2 over PBKDF2:**
+- Winner of the Password Hashing Competition (2015)
+- Better resistance against GPU and ASIC attacks
+- Configurable memory hardness
+- Protection against side-channel attacks (Argon2id variant)
+- Recommended by OWASP for new applications
 
 ### Key Lifecycle
 
@@ -322,6 +353,7 @@ def clear_user_encryption_key(user_id: str) -> None:
 
 from fastapi import Request
 from app.core.encryption import set_user_encryption_key, load_user_dek
+import base64
 
 async def encryption_middleware(request: Request, call_next):
     """Load user encryption key for authenticated requests."""
@@ -330,21 +362,37 @@ async def encryption_middleware(request: Request, call_next):
     user = await get_current_user(request)
     
     if user:
-        # Load and decrypt user's DEK
-        # Master key should be stored in secure session
-        master_key = request.session.get('master_key')
-        if master_key:
-            dek = load_user_dek(user.id, master_key)
+        # Retrieve encrypted session data
+        # Note: Session must be encrypted using secure session middleware
+        # with server-side storage (e.g., Redis) or encrypted cookies
+        encrypted_session_data = request.session.get('encrypted_session_data')
+        
+        if encrypted_session_data:
+            # Decrypt session data using session encryption key
+            # (different from user's data encryption key)
+            session_key = get_session_encryption_key()
+            decrypted_data = decrypt_session(encrypted_session_data, session_key)
+            
+            # Extract DEK from decrypted session
+            dek = base64.b64decode(decrypted_data['dek'])
+            
+            # Store DEK in context for this request
             set_user_encryption_key(str(user.id), dek)
     
     response = await call_next(request)
     
-    # Clear key after request
+    # Clear key after request for security
     if user:
         clear_user_encryption_key(str(user.id))
     
     return response
 ```
+
+**Security Notes:**
+1. **Session Encryption**: The session itself must be encrypted to protect the DEK
+2. **Server-Side Sessions**: Recommended to use Redis or similar for session storage
+3. **Short Timeout**: DEK should expire from session after inactivity (e.g., 15 minutes)
+4. **HTTPS Required**: All of this is meaningless without TLS/HTTPS
 
 ---
 
@@ -450,7 +498,11 @@ async def migrate_user_data(user_id: uuid.UUID, password: str):
         user_id=user_id,
         encrypted_dek=encrypted_dek,
         salt=salt,
-        kdf_params=json.dumps({'iterations': 600000})
+        kdf_params=json.dumps({
+            'time_cost': 3,
+            'memory_cost': 65536,
+            'parallelism': 4
+        })
     )
     session.add(user_key)
     
@@ -561,11 +613,31 @@ async def login(credentials: LoginRequest):
         # Decrypt DEK
         dek = decrypt_dek(user_key_record.encrypted_dek, master_key)
         
-        # Store in secure session (encrypted session cookie)
-        session['encryption_key'] = base64.b64encode(dek).decode()
+        # Store DEK in encrypted server-side session
+        # Important: Use server-side session storage (e.g., Redis)
+        # with encryption to protect the DEK
+        session_data = {
+            'dek': base64.b64encode(dek).decode(),
+            'expires_at': datetime.now() + timedelta(minutes=15)
+        }
+        
+        # Encrypt session data with a separate session encryption key
+        session_key = get_session_encryption_key()
+        encrypted_session = encrypt_session(session_data, session_key)
+        
+        # Store encrypted session
+        session['encrypted_session_data'] = encrypted_session
     
     return access_token
 ```
+
+**Important Security Considerations:**
+
+1. **Never Store Master Key**: Master key is only used temporarily to decrypt the DEK and then discarded
+2. **Encrypt Session Storage**: Session data containing the DEK must be encrypted with a separate session encryption key
+3. **Use Server-Side Sessions**: Client-side cookies are vulnerable even if encrypted
+4. **Short Session Timeout**: DEK expires from session after 15 minutes of inactivity
+5. **Secure Session Backend**: Use Redis or similar with proper security configuration
 
 ---
 
@@ -573,10 +645,11 @@ async def login(credentials: LoginRequest):
 
 ### Phase 1: Foundation (2-3 weeks)
 
-- [ ] Add cryptography dependencies
-- [ ] Implement encryption core module
+- [ ] Add cryptography dependencies (cryptography, argon2-cffi)
+- [ ] Implement encryption core module with Argon2id key derivation
 - [ ] Add `UserEncryptionKey` model and migration
 - [ ] Add configuration flags
+- [ ] Implement secure session handling (server-side, encrypted)
 - [ ] Write unit tests for encryption/decryption
 - [ ] Update security documentation
 
@@ -703,8 +776,17 @@ ENCRYPTION_ENABLED=true
 # Encryption algorithm (default: AES-256-GCM)
 ENCRYPTION_ALGORITHM=aes-256-gcm
 
-# Key derivation iterations (default: 600000)
-ENCRYPTION_KDF_ITERATIONS=600000
+# Key derivation function (default: argon2id)
+ENCRYPTION_KDF=argon2id
+
+# Argon2 time cost - number of iterations (default: 3)
+ENCRYPTION_ARGON2_TIME_COST=3
+
+# Argon2 memory cost in KiB (default: 65536 = 64 MiB)
+ENCRYPTION_ARGON2_MEMORY_COST=65536
+
+# Argon2 parallelism - number of threads (default: 4)
+ENCRYPTION_ARGON2_PARALLELISM=4
 
 # Enable searchable encryption (default: true if encryption enabled)
 ENCRYPTION_SEARCHABLE=true
@@ -725,7 +807,10 @@ class Settings(BaseSettings):
     # Encryption Configuration
     encryption_enabled: bool = False
     encryption_algorithm: str = "aes-256-gcm"
-    encryption_kdf_iterations: int = 600000
+    encryption_kdf: str = "argon2id"
+    encryption_argon2_time_cost: int = 3
+    encryption_argon2_memory_cost: int = 65536  # 64 MiB
+    encryption_argon2_parallelism: int = 4
     encryption_searchable: bool = True
     encryption_key_timeout: int = 900  # seconds
     encryption_require_reauth: bool = True
@@ -818,11 +903,12 @@ The phased approach allows for:
 - Option to pause or adjust based on results
 
 **Key Success Factors:**
-- Strong cryptography (AES-256-GCM, Argon2)
-- Secure key management (never store master keys)
+- Strong cryptography (AES-256-GCM, Argon2id)
+- Secure key management (never store master keys, encrypt session storage)
 - Transparent operation (encryption happens automatically)
 - Good UX (password prompt only when necessary)
 - Comprehensive testing (unit, integration, security)
+- Secure session handling (server-side, encrypted, short timeout)
 
 **Trade-offs to Accept:**
 - Slower search performance
