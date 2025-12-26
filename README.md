@@ -86,6 +86,10 @@ docker run -d \
 
 Read the [docs](https://journiv.com/docs) to learn more about Journiv and configuring it.
 
+### Architecture Documents
+
+- [Encryption Architecture Plan](docs/ENCRYPTION_PLAN.md) - Comprehensive plan for implementing end-to-end encryption for database and filesystem
+
 
 
 ## Contributing
